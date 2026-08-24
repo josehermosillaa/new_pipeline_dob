@@ -97,12 +97,23 @@ class DOBNowClient:
     def _abck_blocked(self):
         if self.context is None:
             return False
-        for cookie in self.context.cookies():
+        # Limit the check to cookies that Chrome would actually send to DOB NOW.
+        # A persistent profile can contain other _abck cookies for unrelated
+        # domains, and their order in context.cookies() is not significant.
+        cookies = self.context.cookies([DOBNOW_URL])
+        found = []
+        for cookie in cookies:
             if cookie.get("name") != "_abck":
                 continue
             parts = (cookie.get("value") or "").split("~", 2)
-            return len(parts) >= 2 and parts[1] == "-1"
-        return False
+            status = parts[1] if len(parts) >= 2 else "unknown"
+            found.append((cookie.get("domain"), cookie.get("path"), status))
+        blocked = any(status == "-1" for _, _, status in found)
+        if blocked:
+            # Never log the cookie value; domain/path/status are enough to
+            # diagnose duplicate or stale cookies safely.
+            self.log.warning("_abck aplicables a DOB NOW (dominio, ruta, estado): %s", found)
+        return blocked
 
     def wait_angular(self, timeout=120):
         deadline = time.time() + timeout
