@@ -1,0 +1,21 @@
+# Entorno Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Datos de entrada y resultados
+data/*.csv
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/*.log
+data/*.log.*
+data/NEEDS_SESSION
+
+# Perfil Chrome: contiene cookies y sesión
+data/chrome_profile*/
+chrome_profile*/
+
+# Archivos temporales
+*.tmp
