@@ -35,6 +35,7 @@ class DOBNowClient:
         self.pw = None
         self.context = None
         self.page = None
+        self._last_abck_warning = None
 
     def open(self):
         try:
@@ -108,12 +109,18 @@ class DOBNowClient:
             parts = (cookie.get("value") or "").split("~", 2)
             status = parts[1] if len(parts) >= 2 else "unknown"
             found.append((cookie.get("domain"), cookie.get("path"), status))
-        blocked = any(status == "-1" for _, _, status in found)
-        if blocked:
+        negative = any(status == "-1" for _, _, status in found)
+        warning_state = tuple(found) if negative else None
+        if negative and warning_state != self._last_abck_warning:
             # Never log the cookie value; domain/path/status are enough to
             # diagnose duplicate or stale cookies safely.
-            self.log.warning("_abck aplicables a DOB NOW (dominio, ruta, estado): %s", found)
-        return blocked
+            self.log.warning(
+                "_abck con estado -1; se continuara mientras el servidor responda normalmente "
+                "(dominio, ruta, estado): %s",
+                found,
+            )
+        self._last_abck_warning = warning_state
+        return negative
 
     def wait_angular(self, timeout=120):
         deadline = time.time() + timeout
@@ -135,8 +142,11 @@ class DOBNowClient:
     def assert_healthy(self, require_angular=False):
         if self._page_access_denied():
             raise BlockedError("Access Denied visible")
-        if self._abck_blocked():
-            raise BlockedError("Sesion marcada como bloqueada (_abck=-1)")
+        # _abck is an opaque Akamai cookie. A '-1' segment is useful telemetry,
+        # but is not by itself proof that DOB NOW rejected the request. The
+        # authoritative stop signals are a visible denial or an HTTP denial in
+        # request_json().
+        self._abck_blocked()
         if require_angular and not self.wait_angular(120):
             raise RequestError("Angular/AuthTokenInterceptor no disponible")
         return True

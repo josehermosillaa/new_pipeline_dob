@@ -225,7 +225,7 @@ Cuando A termine, cambia `--priorities A` por `--priorities B`. No vuelvas a eje
 
 El worker no borra cookies, no limpia el perfil y no rota VPN.
 
-Cuando detecta `Access Denied` o un bloqueo explícito:
+Cuando detecta una respuesta efectiva `Access Denied` o HTTP 403:
 
 1. guarda la tarea exacta como `retry`;
 2. conserva endpoints ya completados;
@@ -267,6 +267,10 @@ google-chrome \
 ```
 
 4. Realizar manualmente el procedimiento de recuperación que corresponda y comprobar que DOB NOW abre sin `Access Denied`.
+
+El valor `_abck=-1` se registra como advertencia de diagnóstico, pero no detiene por sí
+solo el worker. La detención ocurre cuando la página muestra `Access Denied` o el
+servidor devuelve HTTP 403/contenido `Access Denied`. El worker no modifica esa cookie.
 
 5. Cerrar completamente ese Chrome. No debe quedar abierto mientras Patchright intenta utilizar el mismo perfil.
 
