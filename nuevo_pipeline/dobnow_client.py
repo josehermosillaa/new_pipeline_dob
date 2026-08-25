@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import time
 
 
@@ -36,6 +37,7 @@ class DOBNowClient:
         self.context = None
         self.page = None
         self._last_abck_warning = None
+        self._risk = 0
 
     def open(self):
         try:
@@ -110,6 +112,8 @@ class DOBNowClient:
             status = parts[1] if len(parts) >= 2 else "unknown"
             found.append((cookie.get("domain"), cookie.get("path"), status))
         negative = any(status == "-1" for _, _, status in found)
+        if negative:
+            self._risk = 1
         warning_state = tuple(found) if negative else None
         if negative and warning_state != self._last_abck_warning:
             # Never log the cookie value; domain/path/status are enough to
@@ -121,6 +125,23 @@ class DOBNowClient:
             )
         self._last_abck_warning = warning_state
         return negative
+
+    def risk_level(self):
+        return self._risk
+
+    def humanize(self):
+        try:
+            viewport = self.page.viewport_size or {"width": 1280, "height": 720}
+            width = viewport.get("width") or 1280
+            height = viewport.get("height") or 720
+            x = random.randint(int(width * 0.1), int(width * 0.9))
+            y = random.randint(int(height * 0.1), int(height * 0.9))
+            self.page.mouse.move(x, y, steps=random.randint(5, 20))
+            if random.random() < 0.5:
+                self.page.mouse.wheel(0, random.randint(80, 400))
+        except Exception:
+            pass
+        time.sleep(random.uniform(0.2, 0.8))
 
     def wait_angular(self, timeout=120):
         deadline = time.time() + timeout
@@ -141,6 +162,7 @@ class DOBNowClient:
 
     def assert_healthy(self, require_angular=False):
         if self._page_access_denied():
+            self._risk = 2
             raise BlockedError("Access Denied visible")
         # _abck is an opaque Akamai cookie. A '-1' segment is useful telemetry,
         # but is not by itself proof that DOB NOW rejected the request. The
@@ -158,6 +180,7 @@ class DOBNowClient:
 
     def request_json(self, method, path, body=None):
         self.assert_healthy(require_angular=True)
+        self.humanize()
         try:
             result = self.page.evaluate("""
                 async ({method, path, body}) => {
@@ -176,6 +199,7 @@ class DOBNowClient:
                     if (body !== null && body !== undefined && method !== 'GET') {
                         options.body = JSON.stringify(body);
                     }
+                    await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 600) + 200));
                     const response = await fetch('https://a810-dobnow.nyc.gov' + path, options);
                     const text = await response.text();
                     return {status: response.status, text};
@@ -189,6 +213,7 @@ class DOBNowClient:
         status = int(result.get("status") or 0)
         raw = result.get("text") or ""
         if status == 403 or "Access Denied" in raw:
+            self._risk = 2
             raise BlockedError(f"Access Denied HTTP {status}")
         try:
             data = json.loads(raw)
@@ -196,6 +221,7 @@ class DOBNowClient:
             raise RequestError(f"Respuesta no JSON HTTP {status}: {raw[:200]}") from exc
         if status != 200:
             raise RequestError(f"HTTP {status}: {str(data)[:300]}")
+        self._risk = 0
         return data
 
     def search_bin(self, bin_num, street=""):

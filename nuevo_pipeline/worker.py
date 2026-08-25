@@ -23,16 +23,27 @@ LOG = logging.getLogger("dobnow_pipeline")
 
 
 class RequestPacer:
-    def __init__(self, minimum, maximum):
+    def __init__(self, minimum, maximum, risk_fn=None, think_probability=0.05):
         self.minimum = minimum
         self.maximum = maximum
+        self.risk_fn = risk_fn or (lambda: 0)
+        self.think_probability = think_probability
         self.next_at = 0.0
 
     def wait(self):
         delay = self.next_at - time.monotonic()
         if delay > 0:
             time.sleep(delay)
-        self.next_at = time.monotonic() + random.uniform(self.minimum, self.maximum)
+        risk = 0
+        try:
+            risk = int(self.risk_fn())
+        except Exception:
+            risk = 0
+        factor = {0: 1.0, 1: 2.0, 2: 4.0}.get(risk, 1.0)
+        base = random.uniform(self.minimum, self.maximum) * factor
+        if self.think_probability > 0 and random.random() < self.think_probability:
+            base += random.uniform(20, 60)
+        self.next_at = time.monotonic() + base
 
 
 def now():
@@ -573,6 +584,7 @@ def main():
     parser.add_argument("--cdp-port", type=int, default=0, help="Conectar a Chrome existente")
     parser.add_argument("--pause-min", type=float, default=6.0)
     parser.add_argument("--pause-max", type=float, default=15.0)
+    parser.add_argument("--think-probability", type=float, default=0.05, help="Probabilidad de pausa de pensamiento larga (0 = desactivar)")
     parser.add_argument("--retry-delay", type=int, default=900, help="Segundos antes de reintentar error normal")
     parser.add_argument("--resolve-ahead", type=int, default=50, help="Filings con GUID que se mantienen en cola")
     parser.add_argument("--download-every", type=int, default=4, help="Intentar una descarga cada N tareas")
@@ -593,6 +605,8 @@ def main():
         parser.error("Prioridades invalidas")
     if args.pause_min < 0 or args.pause_max < args.pause_min:
         parser.error("Pausas invalidas")
+    if args.think_probability < 0 or args.think_probability > 1:
+        parser.error("--think-probability debe estar entre 0 y 1")
 
     log_file = args.log_file or os.path.splitext(os.path.abspath(args.db))[0] + ".log"
     configure_logging(log_file, args.verbose)
@@ -624,7 +638,10 @@ def main():
             clear_session_block(conn, marker)
             LOG.info("Sesion validada. Marcador NEEDS_SESSION eliminado.")
             return 0
-        pacer = RequestPacer(args.pause_min, args.pause_max)
+        pacer = RequestPacer(
+            args.pause_min, args.pause_max,
+            risk_fn=client.risk_level, think_probability=args.think_probability,
+        )
         while not args.max_tasks or tasks < args.max_tasks:
             task_done = False
             if args.phase == "bins":
