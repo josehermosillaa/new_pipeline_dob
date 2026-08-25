@@ -35,6 +35,21 @@ La estrategia y su justificación estadística están en [`../nuevo/ESTRATEGIA_P
 | `systemd/dobnow-worker.service.example` | Servicio Linux de ejemplo |
 | `tests/test_pipeline.py` | Pruebas de partición y contrato CSV |
 
+## Procesamiento por fases
+
+El worker acepta `--phase all|bins|zoning|portal|downloads`. `all` mantiene el
+flujo combinado original. Las demás opciones permiten trabajar en lotes y hacen
+que `--max-tasks` tenga una unidad clara:
+
+- `bins`: una tarea es un BIN buscado y sus GUID guardados.
+- `zoning`: una tarea es un filing consultado en Zoning Documents.
+- `portal`: una tarea completa PW1 y Documents/Portal para un filing.
+- `downloads`: una tarea resuelve la URL de un documento objetivo.
+
+Todas las fases usan la misma SQLite y son reanudables. No ejecutes más de un
+worker simultáneo contra la misma base. Un ciclo recomendado es `bins`,
+`zoning`, `downloads`, `portal`, `downloads`.
+
 ## SQLite
 
 No se instala SQLite por separado. Python incluye el módulo estándar `sqlite3`.

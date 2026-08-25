@@ -16,7 +16,8 @@ from nuevo_pipeline.export_results import export_database
 from nuevo_pipeline.merge_results import merge
 from nuevo_pipeline.prepare_inputs import classify_priority, prepare
 from nuevo_pipeline.worker import (
-    clear_session_block, close_logging, configure_logging, record_session_block,
+    claim_phase_filing, clear_session_block, close_logging, configure_logging,
+    has_phase_work, record_session_block,
 )
 
 
@@ -140,6 +141,28 @@ class PipelineTests(unittest.TestCase):
             clear_session_block(conn, marker)
             self.assertFalse(os.path.exists(marker))
             self.assertEqual(get_metadata(conn, "session_state"), "HEALTHY")
+            conn.close()
+
+    def test_phase_claims_are_independent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            input_path = os.path.join(temp, "input.csv")
+            with open(input_path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=FIELDS)
+                writer.writeheader()
+                writer.writerow(row("100", "Q1-I1", "New Building"))
+            db = os.path.join(temp, "state.sqlite")
+            prepare(argparse.Namespace(input=input_path, partition="1/1", priorities="A", db=db, force=False))
+            conn = connect(db)
+            conn.execute("UPDATE bins SET status='done'")
+            conn.execute("UPDATE filings SET search_status='done', guid='guid-test'")
+            conn.commit()
+            self.assertTrue(has_phase_work(conn, ("A",), "zoning"))
+            self.assertTrue(has_phase_work(conn, ("A",), "portal"))
+            self.assertIsNotNone(claim_phase_filing(conn, ("A",), "zoning"))
+            conn.execute("UPDATE filings SET zd1wd_status='done', zd1wd_json='[]'")
+            conn.commit()
+            self.assertFalse(has_phase_work(conn, ("A",), "zoning"))
+            self.assertIsNotNone(claim_phase_filing(conn, ("A",), "portal"))
             conn.close()
 
 

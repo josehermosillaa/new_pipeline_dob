@@ -187,6 +187,36 @@ def claim_filing(conn, priorities):
         return dict(row)
 
 
+def claim_phase_filing(conn, priorities, phase):
+    if phase == "zoning":
+        pending = "f.zd1wd_status!='done'"
+    elif phase == "portal":
+        pending = "(f.pw1_status!='done' OR f.portal_status!='done')"
+    else:
+        raise ValueError(f"Fase de filing invalida: {phase}")
+    with transaction(conn, immediate=True):
+        row = conn.execute(f"""
+            SELECT f.*, b.street_name, b.borough AS bin_borough
+            FROM filings f JOIN bins b ON b.bin=f.bin
+            WHERE f.guid IS NOT NULL
+              AND f.search_status='done'
+              AND {pending}
+              AND f.next_attempt_at <= ?
+              AND {priority_clause(priorities, 'f')}
+            ORDER BY CASE f.priority WHEN 'A' THEN 0 WHEN 'B' THEN 1 ELSE 2 END,
+                     b.last_filing_at, f.source_order
+            LIMIT 1
+        """, (now(), *priorities)).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE filings SET attempts=attempts+1, updated_at=? WHERE id=?",
+            (now(), row["id"]),
+        )
+        conn.execute("UPDATE bins SET last_filing_at=? WHERE bin=?", (now(), row["bin"]))
+        return dict(row)
+
+
 def claim_download(conn, priorities):
     with transaction(conn, immediate=True):
         row = conn.execute(f"""
@@ -390,6 +420,73 @@ def process_filing(conn, filing, client, pacer, retry_delay):
         return False
 
 
+def process_zoning(conn, filing, client, pacer, retry_delay):
+    try:
+        docs = fetch_zd1wd(client, filing["guid"], pacer)
+        with transaction(conn):
+            conn.execute("""
+                UPDATE filings SET zd1wd_status='done', zd1wd_json=?, normalized=0,
+                    last_error='', next_attempt_at=0, updated_at=? WHERE id=?
+            """, (dumps(docs), now(), filing["id"]))
+        filing["zd1wd_status"] = "done"
+        filing["zd1wd_json"] = dumps(docs)
+        filing["normalized"] = 0
+        normalize_documents(conn, filing)
+        LOG.info("Filing %s: zoning completado; documentos=%s", filing["job_filing_number"], len(docs))
+        return True
+    except BlockedError as exc:
+        with transaction(conn):
+            conn.execute("UPDATE filings SET zd1wd_status='retry', next_attempt_at=?, last_error=?, updated_at=? WHERE id=?", (now() + retry_delay, str(exc), now(), filing["id"]))
+            event(conn, "BLOCK", "filing", filing["id"], str(exc))
+        raise
+    except Exception as exc:
+        with transaction(conn):
+            conn.execute("UPDATE filings SET zd1wd_status='retry', next_attempt_at=?, last_error=?, updated_at=? WHERE id=?", (now() + retry_delay, str(exc), now(), filing["id"]))
+            event(conn, "ERROR", "filing", filing["id"], str(exc))
+        LOG.error("Filing %s zoning pasa a retry: %s", filing["job_filing_number"], exc)
+        return False
+
+
+def process_portal_phase(conn, filing, client, pacer, retry_delay):
+    current_endpoint = ""
+    try:
+        pw1 = loads(filing.get("pw1_json"), {})
+        if filing["pw1_status"] != "done":
+            current_endpoint = "pw1_status"
+            pw1 = fetch_pw1(client, filing["guid"], pacer)
+            with transaction(conn):
+                conn.execute("UPDATE filings SET pw1_status='done', pw1_json=?, last_error='', updated_at=? WHERE id=?", (dumps(pw1), now(), filing["id"]))
+            filing["pw1_status"] = "done"
+            filing["pw1_json"] = dumps(pw1)
+        if filing["portal_status"] != "done":
+            current_endpoint = "portal_status"
+            docs = fetch_portal(client, filing["guid"], pw1, pacer)
+            with transaction(conn):
+                conn.execute("""
+                    UPDATE filings SET portal_status='done', portal_json=?, normalized=0,
+                        last_error='', next_attempt_at=0, updated_at=? WHERE id=?
+                """, (dumps(docs), now(), filing["id"]))
+            filing["portal_status"] = "done"
+            filing["portal_json"] = dumps(docs)
+            filing["normalized"] = 0
+        normalize_documents(conn, filing)
+        LOG.info("Filing %s: portal completado", filing["job_filing_number"])
+        return True
+    except BlockedError as exc:
+        with transaction(conn):
+            if current_endpoint:
+                conn.execute(f"UPDATE filings SET {current_endpoint}='retry', next_attempt_at=?, last_error=?, updated_at=? WHERE id=?", (now() + retry_delay, str(exc), now(), filing["id"]))
+            event(conn, "BLOCK", "filing", filing["id"], str(exc))
+        raise
+    except Exception as exc:
+        with transaction(conn):
+            if current_endpoint:
+                conn.execute(f"UPDATE filings SET {current_endpoint}='retry', next_attempt_at=?, last_error=?, updated_at=? WHERE id=?", (now() + retry_delay, str(exc), now(), filing["id"]))
+            event(conn, "ERROR", "filing", filing["id"], str(exc))
+        LOG.error("Filing %s portal pasa a retry: %s", filing["job_filing_number"], exc)
+        return False
+
+
 def process_download(conn, document, client, pacer, retry_delay):
     try:
         input_row = loads(document["input_json"], {}) or {}
@@ -431,6 +528,28 @@ def has_any_work(conn, priorities):
     return bool(bin_count or filing_count or download_count)
 
 
+def has_phase_work(conn, priorities, phase):
+    if phase == "all":
+        return has_any_work(conn, priorities)
+    if phase == "bins":
+        sql = f"SELECT COUNT(*) FROM bins WHERE status IN ('pending','retry','running') AND {priority_clause(priorities)}"
+        return bool(conn.execute(sql, priorities).fetchone()[0])
+    if phase in ("zoning", "portal"):
+        pending = "f.zd1wd_status!='done'" if phase == "zoning" else "(f.pw1_status!='done' OR f.portal_status!='done')"
+        sql = f"""
+            SELECT COUNT(*) FROM filings f WHERE f.guid IS NOT NULL
+              AND f.search_status='done' AND {pending}
+              AND {priority_clause(priorities, 'f')}
+        """
+        return bool(conn.execute(sql, priorities).fetchone()[0])
+    sql = f"""
+        SELECT COUNT(*) FROM documents d JOIN filings f ON f.id=d.filing_id
+        WHERE d.download_status IN ('pending','retry','running')
+          AND {priority_clause(priorities, 'f')}
+    """
+    return bool(conn.execute(sql, priorities).fetchone()[0])
+
+
 def recover_in_progress(conn):
     """Devuelve a retry tareas que quedaron running por un cierre abrupto."""
     with transaction(conn):
@@ -458,6 +577,10 @@ def main():
     parser.add_argument("--resolve-ahead", type=int, default=50, help="Filings con GUID que se mantienen en cola")
     parser.add_argument("--download-every", type=int, default=4, help="Intentar una descarga cada N tareas")
     parser.add_argument("--max-tasks", type=int, default=0, help="0 = sin limite")
+    parser.add_argument(
+        "--phase", choices=("all", "bins", "zoning", "portal", "downloads"),
+        default="all", help="Limitar el worker a una fase; all conserva el flujo combinado",
+    )
     parser.add_argument("--status", action="store_true", help="Mostrar estado y salir")
     parser.add_argument("--check-session", action="store_true", help="Validar sesion, limpiar NEEDS_SESSION y salir")
     parser.add_argument("--block-threshold", type=int, default=3, help="Bloqueos consecutivos antes de NEEDS_SESSION")
@@ -473,7 +596,7 @@ def main():
 
     log_file = args.log_file or os.path.splitext(os.path.abspath(args.db))[0] + ".log"
     configure_logging(log_file, args.verbose)
-    LOG.info("Inicio worker db=%s prioridades=%s", os.path.abspath(args.db), ",".join(priorities))
+    LOG.info("Inicio worker db=%s prioridades=%s fase=%s", os.path.abspath(args.db), ",".join(priorities), args.phase)
 
     conn = connect(args.db)
     initialize(conn)
@@ -504,25 +627,49 @@ def main():
         pacer = RequestPacer(args.pause_min, args.pause_max)
         while not args.max_tasks or tasks < args.max_tasks:
             task_done = False
-            if tasks > 0 and tasks % args.download_every == 0:
+            if args.phase == "bins":
+                item = claim_bin(conn, priorities)
+                if item:
+                    resolve_bin(conn, item, client, pacer, args.retry_delay)
+                    tasks += 1
+                    task_done = True
+            elif args.phase == "zoning":
+                filing = claim_phase_filing(conn, priorities, "zoning")
+                if filing:
+                    process_zoning(conn, filing, client, pacer, args.retry_delay)
+                    tasks += 1
+                    task_done = True
+            elif args.phase == "portal":
+                filing = claim_phase_filing(conn, priorities, "portal")
+                if filing:
+                    process_portal_phase(conn, filing, client, pacer, args.retry_delay)
+                    tasks += 1
+                    task_done = True
+            elif args.phase == "downloads":
                 document = claim_download(conn, priorities)
                 if document:
                     process_download(conn, document, client, pacer, args.retry_delay)
                     tasks += 1
                     task_done = True
-            if ready_filing_count(conn, priorities) < args.resolve_ahead:
+            elif tasks > 0 and tasks % args.download_every == 0:
+                document = claim_download(conn, priorities)
+                if document:
+                    process_download(conn, document, client, pacer, args.retry_delay)
+                    tasks += 1
+                    task_done = True
+            if args.phase == "all" and ready_filing_count(conn, priorities) < args.resolve_ahead:
                 item = None if task_done else claim_bin(conn, priorities)
                 if item:
                     resolve_bin(conn, item, client, pacer, args.retry_delay)
                     tasks += 1
                     task_done = True
-            if not task_done:
+            if args.phase == "all" and not task_done:
                 filing = claim_filing(conn, priorities)
                 if filing:
                     process_filing(conn, filing, client, pacer, args.retry_delay)
                     tasks += 1
                     task_done = True
-            if not task_done:
+            if args.phase == "all" and not task_done:
                 document = claim_download(conn, priorities)
                 if document:
                     process_download(conn, document, client, pacer, args.retry_delay)
@@ -531,7 +678,7 @@ def main():
             if task_done:
                 mark_task_success(conn)
             if not task_done:
-                if has_any_work(conn, priorities):
+                if has_phase_work(conn, priorities, args.phase):
                     next_times = [row[0] for row in conn.execute("""
                         SELECT next_attempt_at FROM bins WHERE status='retry' AND next_attempt_at>?
                         UNION ALL SELECT next_attempt_at FROM filings WHERE next_attempt_at>?
@@ -542,7 +689,7 @@ def main():
                         LOG.info("Sin tareas elegibles. Esperando %.0fs", wait)
                         time.sleep(wait)
                         continue
-                LOG.info("No quedan tareas para las prioridades solicitadas")
+                LOG.info("No quedan tareas elegibles para fase=%s y prioridades solicitadas", args.phase)
                 break
         LOG.info("Resumen final: %s", json.dumps(summary(conn), ensure_ascii=False))
         return 0
