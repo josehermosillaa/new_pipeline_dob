@@ -1,0 +1,56 @@
+abrir el chrome en el puerto
+
+google-chrome-stable \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$PWD/data/chrome_profile_pc1" \
+  "https://a810-dobnow.nyc.gov/Publish/"
+
+ejecutar solo guid
+1. Obtener BIN y GUID
+python3 nuevo_pipeline/worker.py \
+  --db data/state_pc1.sqlite \
+  --profile data/chrome_profile_pc1 \
+  --cdp-port 9222 \
+  --priorities A \
+  --phase bins \
+  --max-tasks 250 \
+  --pause-min 15 \
+  --pause-max 20 \
+  --retry-delay 1800 \
+  --log-file data/worker_pc1.log
+2. Procesar Zoning
+python3 nuevo_pipeline/worker.py \
+  --db data/state_pc1.sqlite \
+  --profile data/chrome_profile_pc1 \
+  --cdp-port 9222 \
+  --priorities A \
+  --phase zoning \
+  --max-tasks 500 \
+  --pause-min 15 \
+  --pause-max 20 \
+  --retry-delay 1800 \
+  --log-file data/worker_pc1.log
+3. Procesar PW1 + Portal/Documents
+python3 nuevo_pipeline/worker.py \
+  --db data/state_pc1.sqlite \
+  --profile data/chrome_profile_pc1 \
+  --cdp-port 9222 \
+  --priorities A \
+  --phase portal \
+  --max-tasks 500 \
+  --pause-min 15 \
+  --pause-max 20 \
+  --retry-delay 1800 \
+  --log-file data/worker_pc1.log
+4. Resolver URLs de documentos
+python3 nuevo_pipeline/worker.py \
+  --db data/state_pc1.sqlite \
+  --profile data/chrome_profile_pc1 \
+  --cdp-port 9222 \
+  --priorities A \
+  --phase downloads \
+  --max-tasks 800 \
+  --pause-min 15 \
+  --pause-max 20 \
+  --retry-delay 1800 \
+  --log-file data/worker_pc1.log
